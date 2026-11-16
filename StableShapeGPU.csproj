@@ -26,8 +26,8 @@
     <PackageReference Include="ComputeSharp" Version="2.1.0" />
     <PackageReference Include="Grasshopper" Version="8.0.23304.9001" Condition="!$(TargetFramework.StartsWith('net4'))" ExcludeAssets="runtime" />
 	<PackageReference Include="CommunityToolkit.Mvvm" Version="8.2.2" />
-    <PackageReference Include="System.Configuration.ConfigurationManager" Version="9.0.4" />
-    <PackageReference Include="System.Resources.Extensions" Version="9.0.4" />
+    <PackageReference Include="System.Configuration.ConfigurationManager" Version="7.0.0" />
+    <PackageReference Include="System.Resources.Extensions" Version="7.0.0" />
   </ItemGroup>
   
   <!-- For Windows only builds -->
