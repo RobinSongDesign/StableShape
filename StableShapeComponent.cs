@@ -1,3 +1,4 @@
+using ComputeSharp;
 using Grasshopper;
 using Grasshopper.Kernel;
 using Rhino.Geometry;
@@ -15,6 +16,9 @@ namespace StableShapeGPU
         private static StableFluid3D sf3;
         private static GpuMeshSolver meshSolver;
         private static List<Line> lns = new List<Line>();
+
+        /// <summary>Mesh sub steps simulated on the GPU for every fluid step.</summary>
+        private const int MeshSubSteps = 10;
 
         /// <summary>
         /// Each implementation of GH_Component must provide a public 
@@ -83,12 +87,16 @@ namespace StableShapeGPU
             if (!DA.GetData(7, ref mesh)) return;
 
 
-            if (reset || init)
+            if (reset || init || sf3 == null || meshSolver == null)
             {
-                reset = false;
                 init = false;
+
+                // Release the GPU memory of the previous simulation before allocating a new one
+                meshSolver?.Dispose();
+                sf3?.Dispose();
+
                 sf3 = new StableFluid3D(size[0], size[1], size[2], 0.1f, (float)diffusion, (float)viscocity);
-                meshSolver = new GpuMeshSolver(mesh);
+                meshSolver = new GpuMeshSolver(sf3.Device, mesh);
                 if (forces.Count > 0 && dots.Count > 0)
                 {
                     sf3.AddDot(dots, 10f);
@@ -96,21 +104,19 @@ namespace StableShapeGPU
                 }
             }
 
-            lns.Clear();
-            sf3.AddVelocity();
-            sf3.Update();
-
-            for(int m = 0; m < 10; m++)
+            // Record the fluid step and all the mesh sub steps into one GPU batch:
+            // the CPU waits for the GPU a single time, when the context is disposed.
+            using (ComputeContext context = sf3.Device.CreateComputeContext())
             {
-                meshSolver.SimulateFrame(sf3);
-                Mesh remesh = meshSolver.ReconstructMesh();
-                DA.SetData(1, remesh);
+                sf3.RecordStep(in context);
+                meshSolver.RecordSteps(in context, sf3, MeshSubSteps);
             }
 
-            if (ShowVelocityField)
-            {
-                lns = sf3.DrawVector();
-            }
+            // Download the vertices once per solution, only for the mesh that is displayed
+            DA.SetData(1, meshSolver.ReconstructMesh());
+
+            // The velocity field is only downloaded when the preview is requested
+            lns = ShowVelocityField ? sf3.DrawVector() : new List<Line>();
 
             //float[,,] density = sf3.GetDensity();
             //Vector3d[,,]velocity = sf3.GetVelocityField();

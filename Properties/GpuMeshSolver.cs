@@ -1,20 +1,26 @@
 ﻿using ComputeSharp;
 using Rhino.Geometry;
+using System;
 using System.Collections.Generic;
 using System.Linq;
-using System.Runtime.CompilerServices;
 
 namespace StableShapeGPU.Properties
 {
-    // Use the float3 type from ComputeSharp for GPU data
+    // Use the vector types from ComputeSharp for GPU data
     using float3 = ComputeSharp.Float3;
     using int2 = ComputeSharp.Int2;
 
-    public class GpuMeshSolver
+    /// <summary>
+    /// Mass-spring mesh driven by a GPU velocity field.
+    /// <para>
+    /// The particles live on the GPU for the whole simulation. Any number of sub steps can be
+    /// recorded into one <see cref="ComputeContext"/>; the vertices are downloaded only when
+    /// <see cref="ReconstructMesh"/> is called, i.e. once per displayed frame.
+    /// </para>
+    /// </summary>
+    public sealed class GpuMeshSolver : IDisposable
     {
         private readonly GraphicsDevice gpuDevice;
-
-        private ReadWriteBuffer<float3> tempSpringForces;
 
         // --- GPU Buffers ---
         // Particle data
@@ -22,170 +28,218 @@ namespace StableShapeGPU.Properties
         private readonly ReadWriteBuffer<float3> particleVelocities;
         private readonly ReadWriteBuffer<float3> particleAccelerations;
 
-        // Spring data (read-only on the GPU)
-        private readonly ReadOnlyBuffer<int2> springIndices;
-        private readonly ReadOnlyBuffer<float> springRestLengths;
+        // Spring adjacency in CSR layout (read-only on the GPU):
+        // particle p owns the entries [adjacencyRanges[p].X, adjacencyRanges[p].Y)
+        // of adjacencyNeighbours / adjacencyRestLengths.
+        private readonly ReadOnlyBuffer<int2> adjacencyRanges;
+        private readonly ReadOnlyBuffer<int> adjacencyNeighbours;
+        private readonly ReadOnlyBuffer<float> adjacencyRestLengths;
 
-        // Mesh topology for reconstruction
+        // Mesh topology and CPU staging memory for the reconstruction (allocated once)
         private readonly MeshFace[] meshFaces;
+        private readonly float3[] positionsCpu;
+        private readonly Point3f[] verticesCpu;
 
-        public GpuMeshSolver(Mesh mesh)
+        public GpuMeshSolver(Mesh mesh) : this(GraphicsDevice.GetDefault(), mesh)
         {
-            this.gpuDevice = GraphicsDevice.GetDefault();
+        }
 
-            // --- Initialization (was MeshProcess) ---
-            var particles = new Particle[mesh.Vertices.Count];
-            var springs = new List<Spring>();
-            var processedEdges = new List<string>();
+        public GpuMeshSolver(GraphicsDevice device, Mesh mesh)
+        {
+            gpuDevice = device;
 
-            // This part still runs on the CPU once to set up the data
-            for (int i = 0; i < mesh.Vertices.Count; i++)
+            int particleCount = mesh.Vertices.Count;
+
+            // --- Particles ---
+            positionsCpu = new float3[particleCount];
+            verticesCpu = new Point3f[particleCount];
+            for (int i = 0; i < particleCount; i++)
             {
-                particles[i] = new Particle(mesh.Vertices[i]);
+                Point3f p = mesh.Vertices[i];
+                positionsCpu[i] = new float3(p.X, p.Y, p.Z);
             }
 
-            foreach (var face in mesh.Faces)
+            // --- Springs: one per unique mesh edge ---
+            var springs = new List<Spring>();
+            var processedEdges = new HashSet<long>();
+            foreach (MeshFace face in mesh.Faces)
             {
+                AddSpring(springs, processedEdges, face.A, face.B);
+                AddSpring(springs, processedEdges, face.B, face.C);
                 if (face.IsQuad)
                 {
-                    SpringProcess(particles, springs, face.A, face.B, processedEdges);
-                    SpringProcess(particles, springs, face.B, face.C, processedEdges);
-                    SpringProcess(particles, springs, face.C, face.D, processedEdges);
-                    SpringProcess(particles, springs, face.D, face.A, processedEdges);
+                    AddSpring(springs, processedEdges, face.C, face.D);
+                    AddSpring(springs, processedEdges, face.D, face.A);
                 }
                 else
                 {
-                    SpringProcess(particles, springs, face.A, face.B, processedEdges);
-                    SpringProcess(particles, springs, face.B, face.C, processedEdges);
-                    SpringProcess(particles, springs, face.C, face.A, processedEdges);
+                    AddSpring(springs, processedEdges, face.C, face.A);
                 }
             }
 
             // --- Upload to GPU ---
-            // Convert CPU data to GPU-friendly formats
-            float3[] initialPositions = new float3[particles.Length];
-            for (int i = 0; i < particles.Length; i++)
-            {
-                var p = particles[i].position;
-                initialPositions[i] = new float3((float)p.X, (float)p.Y, (float)p.Z);
-            }
+            BuildAdjacency(particleCount, springs, out int2[] ranges, out int[] neighbours, out float[] restLengths);
 
-            int2[] springIdx = new int2[springs.Count];
-            float[] restLengths = new float[springs.Count];
-            for (int i = 0; i < springs.Count; i++)
-            {
-                springIdx[i] = new int2(springs[i].vertex0, springs[i].vertex1);
-                restLengths[i] = (float)springs[i].restlen;
-            }
-
-            // Allocate and copy data to GPU buffers
-            this.particlePositions = gpuDevice.AllocateReadWriteBuffer<float3>(initialPositions);
-            this.particleVelocities = gpuDevice.AllocateReadWriteBuffer<float3>(particles.Length);
-            this.particleAccelerations = gpuDevice.AllocateReadWriteBuffer<float3>(particles.Length);
-            this.springIndices = gpuDevice.AllocateReadOnlyBuffer<int2>(springIdx);
-            this.springRestLengths = gpuDevice.AllocateReadOnlyBuffer<float>(restLengths);
-
-            this.tempSpringForces = gpuDevice.AllocateReadWriteBuffer<float3>(springs.Count);
+            particlePositions = gpuDevice.AllocateReadWriteBuffer<float3>(positionsCpu);
+            particleVelocities = gpuDevice.AllocateReadWriteBuffer<float3>(particleCount, AllocationMode.Clear);
+            particleAccelerations = gpuDevice.AllocateReadWriteBuffer<float3>(particleCount, AllocationMode.Clear);
+            adjacencyRanges = gpuDevice.AllocateReadOnlyBuffer<int2>(ranges);
+            adjacencyNeighbours = gpuDevice.AllocateReadOnlyBuffer<int>(neighbours);
+            adjacencyRestLengths = gpuDevice.AllocateReadOnlyBuffer<float>(restLengths);
 
             // Keep mesh faces on CPU for final reconstruction
             meshFaces = mesh.Faces.ToArray();
         }
 
-        // Helper for initialization
-        private static void SpringProcess(Particle[] particles, List<Spring> springs, int v0, int v1, List<string> processedEdges)
+        /// <summary>Registers the edge (v0, v1) as a spring unless it already exists.</summary>
+        private void AddSpring(List<Spring> springs, HashSet<long> processedEdges, int v0, int v1)
         {
-            string edgeID = v0 < v1 ? $"{v0}_{v1}" : $"{v1}_{v0}";
-            if (!processedEdges.Contains(edgeID))
+            long edgeId = v0 < v1 ? ((long)v0 << 32) | (uint)v1 : ((long)v1 << 32) | (uint)v0;
+            if (!processedEdges.Add(edgeId)) return;
+
+            float3 delta = positionsCpu[v1] - positionsCpu[v0];
+            float restlen = (float)Math.Sqrt(delta.X * delta.X + delta.Y * delta.Y + delta.Z * delta.Z);
+            springs.Add(new Spring(v0, v1, restlen));
+        }
+
+        /// <summary>
+        /// Converts the spring list into a per-particle adjacency (CSR layout), so each particle
+        /// only visits its own springs on the GPU instead of scanning all of them.
+        /// </summary>
+        private static void BuildAdjacency(int particleCount, List<Spring> springs, out int2[] ranges, out int[] neighbours, out float[] restLengths)
+        {
+            // Count the springs attached to each particle
+            var counts = new int[particleCount];
+            foreach (Spring s in springs)
             {
-                processedEdges.Add(edgeID);
-                float restlen = (float)(particles[v1].position - particles[v0].position).Length;
-                springs.Add(new Spring(v0, v1, restlen));
+                counts[s.vertex0]++;
+                counts[s.vertex1]++;
+            }
+
+            // Prefix sum -> [start, end) of each particle
+            ranges = new int2[particleCount];
+            var cursor = new int[particleCount];
+            int total = 0;
+            for (int i = 0; i < particleCount; i++)
+            {
+                ranges[i] = new int2(total, total + counts[i]);
+                cursor[i] = total;
+                total += counts[i];
+            }
+
+            // Every spring is stored twice, once for each end.
+            // At least one element is allocated: GPU buffers cannot be empty.
+            neighbours = new int[Math.Max(1, total)];
+            restLengths = new float[Math.Max(1, total)];
+            foreach (Spring s in springs)
+            {
+                neighbours[cursor[s.vertex0]] = s.vertex1;
+                restLengths[cursor[s.vertex0]++] = s.restlen;
+
+                neighbours[cursor[s.vertex1]] = s.vertex0;
+                restLengths[cursor[s.vertex1]++] = s.restlen;
             }
         }
 
-        public void SimulateFrame(StableFluid3D fluidSolver)
+        /// <summary>Runs the given number of sub steps as a single GPU batch.</summary>
+        public void Simulate(IVelocityField3D field, int subSteps = 1)
         {
-            // --- Run the entire simulation on the GPU ---
-
-            // 1. Clear accelerations from the previous frame
-            gpuDevice.For(particleAccelerations.Length, new ClearFloat3BufferShader(particleAccelerations));
-
-            // 2. Advect particles with the fluid's velocity field
-            gpuDevice.For(
-                particlePositions.Length,
-                new MeshAdvectionShader(
-                    particlePositions,
-                    particleVelocities,
-                    fluidSolver.u, fluidSolver.v, fluidSolver.w, // Pass fluid velocity textures
-                    fluidSolver.sizeX, fluidSolver.sizeY, fluidSolver.sizeZ));
-
-            // 3.Move particles based on their velocities
-            gpuDevice.For(
-                particlePositions.Length,
-                new ParticleMoveShader(
-                    particlePositions,
-                    particleVelocities,
-                    particleAccelerations,
-                    Particle.timeStep,
-                    Particle.damping,
-                    Particle.drag));
-
-            // 4. Calculate and apply spring tensions
-            gpuDevice.For(
-                springIndices.Length,
-                new CalculateSpringForcesShader(
-                    particlePositions,
-                    springIndices,
-                    springRestLengths,
-                    tempSpringForces, // 写入到临时缓冲区
-                    Particle.k,
-                    Particle.mass));
-            gpuDevice.For(
-                particlePositions.Length,
-                new GatherForcesShader(
-                    particleAccelerations,
-                    tempSpringForces, // 从临时缓冲区读取
-                    springIndices,
-                    springIndices.Length,
-                    Particle.mass));
-
-            // 5. Move particles based on physics
-            gpuDevice.For(
-                particlePositions.Length,
-                new ParticleMoveShader(
-                    particlePositions,
-                    particleVelocities,
-                    particleAccelerations,
-                    Particle.timeStep,
-                    Particle.damping,
-                    Particle.drag));
+            using (ComputeContext context = gpuDevice.CreateComputeContext())
+            {
+                RecordSteps(in context, field, subSteps);
+            }
         }
 
+        /// <summary>
+        /// Records the given number of sub steps into an existing context without executing it,
+        /// so the mesh can share one GPU submission with the fluid solver.
+        /// </summary>
+        public void RecordSteps(in ComputeContext context, IVelocityField3D field, int subSteps = 1)
+        {
+            int count = particlePositions.Length;
+
+            for (int step = 0; step < subSteps; step++)
+            {
+                // 1. Take the fluid velocity and move the particles with it
+                context.For(
+                    count,
+                    new MeshAdvectionShader(
+                        particlePositions,
+                        particleVelocities,
+                        field.U, field.V, field.W,
+                        field.SizeX, field.SizeY, field.SizeZ,
+                        Particle.timeStep,
+                        Particle.damping,
+                        Particle.drag));
+                context.Barrier(particlePositions);
+                context.Barrier(particleVelocities);
+
+                // 2. Spring tension of every particle
+                context.For(
+                    count,
+                    new SpringForcesShader(
+                        particlePositions,
+                        particleAccelerations,
+                        adjacencyRanges,
+                        adjacencyNeighbours,
+                        adjacencyRestLengths,
+                        Particle.k,
+                        Particle.mass));
+                context.Barrier(particleAccelerations);
+
+                // 3. Move the particles with the spring tension
+                context.For(
+                    count,
+                    new ParticleMoveShader(
+                        particlePositions,
+                        particleVelocities,
+                        particleAccelerations,
+                        Particle.timeStep,
+                        Particle.damping,
+                        Particle.drag));
+                context.Barrier(particlePositions);
+                context.Barrier(particleVelocities);
+            }
+        }
+
+        /// <summary>
+        /// Downloads the particle positions and rebuilds the Rhino mesh.
+        /// This is the only GPU -> CPU transfer of the solver: call it once per displayed frame.
+        /// </summary>
         public Mesh ReconstructMesh()
         {
-            Mesh remesh = new Mesh();
+            particlePositions.CopyTo(positionsCpu);
 
-            // The ONLY data transfer from GPU to CPU happens here!
-            float3[] finalPositions = particlePositions.ToArray();
-
-            // Convert float3 back to Point3d for Rhino
-            Point3d[] vertices = new Point3d[finalPositions.Length];
-            for (int i = 0; i < finalPositions.Length; i++)
+            for (int i = 0; i < positionsCpu.Length; i++)
             {
-                vertices[i] = new Point3d(finalPositions[i].X, finalPositions[i].Y, finalPositions[i].Z);
+                float3 p = positionsCpu[i];
+                verticesCpu[i] = new Point3f(p.X, p.Y, p.Z);
             }
 
-            remesh.Vertices.AddVertices(vertices);
+            Mesh remesh = new Mesh();
+            remesh.Vertices.AddVertices(verticesCpu);
             remesh.Faces.AddFaces(meshFaces);
-
-            remesh.Compact();
             remesh.Normals.ComputeNormals();
 
             return remesh;
         }
+
+        /// <summary>Releases every GPU buffer owned by the solver.</summary>
+        public void Dispose()
+        {
+            particlePositions.Dispose();
+            particleVelocities.Dispose();
+            particleAccelerations.Dispose();
+            adjacencyRanges.Dispose();
+            adjacencyNeighbours.Dispose();
+            adjacencyRestLengths.Dispose();
+        }
     }
 
-    // --- Advection Shader ---
+    /// <summary>
+    /// Samples the fluid velocity at each particle (trilinear interpolation)
+    /// and moves the particle with it.
+    /// </summary>
     [AutoConstructor]
     [EmbeddedBytecode(DispatchAxis.X)]
     public readonly partial struct MeshAdvectionShader : IComputeShader
@@ -194,34 +248,34 @@ namespace StableShapeGPU.Properties
         private readonly ReadWriteBuffer<float3> velocities;
         private readonly ReadWriteTexture3D<float> u, v, w;
         private readonly int sizeX, sizeY, sizeZ;
+        private readonly float timeStep, damping, drag;
 
         public void Execute()
         {
             int i = ThreadIds.X; // The index of the current particle
             float3 pos = positions[i];
 
-            // 1. Clamp position to be within the valid grid bounds for interpolation
-            pos.X = Hlsl.Max(0.5f, Hlsl.Min(sizeX - 1.5f, pos.X));
-            pos.Y = Hlsl.Max(0.5f, Hlsl.Min(sizeY - 1.5f, pos.Y));
-            pos.Z = Hlsl.Max(0.5f, Hlsl.Min(sizeZ - 1.5f, pos.Z));
+            // 1. Clamp the sample position to the valid grid bounds for interpolation
+            float x = Hlsl.Max(0.5f, Hlsl.Min(sizeX - 1.5f, pos.X));
+            float y = Hlsl.Max(0.5f, Hlsl.Min(sizeY - 1.5f, pos.Y));
+            float z = Hlsl.Max(0.5f, Hlsl.Min(sizeZ - 1.5f, pos.Z));
 
-            //// 2. Determine the integer indices of the 8 surrounding grid cells
-            int i0 = (int)pos.X;
+            // 2. Integer indices of the 8 surrounding grid cells
+            int i0 = (int)x;
             int i1 = i0 + 1;
-            int j0 = (int)pos.Y;
+            int j0 = (int)y;
             int j1 = j0 + 1;
-            int k0 = (int)pos.Z;
+            int k0 = (int)z;
             int k1 = k0 + 1;
 
-            // 3. Calculate the fractional interpolation weights
-            float s1 = pos.X - i0;
-            float t1 = pos.Y - j0;
-            float r1 = pos.Z - k0;
+            // 3. Fractional interpolation weights
+            float s1 = x - i0;
+            float t1 = y - j0;
+            float r1 = z - k0;
 
-            // 4. Sample the velocity components (u, v, w) from the 8 surrounding cells
-            //    and perform trilinear interpolation for each component separately.
+            // 4. Trilinear interpolation of each velocity component
 
-            // --- Interpolate for U component (X velocity) ---
+            // --- U component (X velocity) ---
             float u_x0 = Hlsl.Lerp(u[i0, j0, k0], u[i1, j0, k0], s1);
             float u_x1 = Hlsl.Lerp(u[i0, j1, k0], u[i1, j1, k0], s1);
             float u_x2 = Hlsl.Lerp(u[i0, j0, k1], u[i1, j0, k1], s1);
@@ -230,7 +284,7 @@ namespace StableShapeGPU.Properties
             float u_y1 = Hlsl.Lerp(u_x2, u_x3, t1);
             float finalU = Hlsl.Lerp(u_y0, u_y1, r1);
 
-            // --- Interpolate for V component (Y velocity) ---
+            // --- V component (Y velocity) ---
             float v_x0 = Hlsl.Lerp(v[i0, j0, k0], v[i1, j0, k0], s1);
             float v_x1 = Hlsl.Lerp(v[i0, j1, k0], v[i1, j1, k0], s1);
             float v_x2 = Hlsl.Lerp(v[i0, j0, k1], v[i1, j0, k1], s1);
@@ -239,7 +293,7 @@ namespace StableShapeGPU.Properties
             float v_y1 = Hlsl.Lerp(v_x2, v_x3, t1);
             float finalV = Hlsl.Lerp(v_y0, v_y1, r1);
 
-            // --- Interpolate for W component (Z velocity) ---
+            // --- W component (Z velocity) ---
             float w_x0 = Hlsl.Lerp(w[i0, j0, k0], w[i1, j0, k0], s1);
             float w_x1 = Hlsl.Lerp(w[i0, j1, k0], w[i1, j1, k0], s1);
             float w_x2 = Hlsl.Lerp(w[i0, j0, k1], w[i1, j0, k1], s1);
@@ -248,122 +302,57 @@ namespace StableShapeGPU.Properties
             float w_y1 = Hlsl.Lerp(w_x2, w_x3, t1);
             float finalW = Hlsl.Lerp(w_y0, w_y1, r1);
 
-            //// 5. Assemble the final interpolated velocity vector
-            float3 fluidVelocity = new float3(finalU,finalV,finalW);
+            // 5. The particle takes the fluid velocity, then moves with drag and damping
+            //    (same integration as ParticleMoveShader with a zero acceleration)
+            float3 velocity = new float3(finalU, finalV, finalW);
+            velocity -= velocity * drag * timeStep;
+            velocity *= damping;
 
-            //// 6. Assign the smooth, interpolated velocity to the particle
-            velocities[i] = fluidVelocity;
+            velocities[i] = velocity;
+            positions[i] = pos + velocity * timeStep;
         }
     }
 
-    // --- Tension Shader ---
-    //[AutoConstructor]
-    //[EmbeddedBytecode(DispatchAxis.X)]
-    //public readonly partial struct ApplyTensionShader : IComputeShader
-    //{
-    //    private readonly ReadWriteBuffer<float3> positions;
-    //    private readonly ReadOnlyBuffer<int2> springIndices;
-    //    private readonly ReadOnlyBuffer<float> springRestLengths;
-    //    private readonly ReadWriteBuffer<float3> accelerations;
-    //    private readonly float k, mass;
-
-    //    public void Execute()
-    //    {
-    //        int i = ThreadIds.X;
-    //        int2 indices = springIndices[i];
-
-    //        float3 pos0 = positions[indices.X];
-    //        float3 pos1 = positions[indices.Y];
-
-    //        float3 forceVec = pos1 - pos0;
-    //        float currentLength = Hlsl.Length(forceVec);
-
-    //        if (currentLength > 0.001f)
-    //        {
-    //            float3 force = (forceVec / currentLength) * (k * (currentLength - springRestLengths[i]) / mass);
-
-
-    //        }
-    //    }
-    //}
-
-    // --- Particle Move Shader ---
-
-    // --- 第 1 遍: 计算每个弹簧的力 ---
+    /// <summary>
+    /// Sums the spring tension acting on each particle. A particle only visits
+    /// its own springs and only writes its own acceleration, so the pass is race free.
+    /// </summary>
     [AutoConstructor]
     [EmbeddedBytecode(DispatchAxis.X)]
-    public readonly partial struct CalculateSpringForcesShader : IComputeShader
+    public readonly partial struct SpringForcesShader : IComputeShader
     {
         private readonly ReadWriteBuffer<float3> positions;
-        private readonly ReadOnlyBuffer<int2> springIndices;
-        private readonly ReadOnlyBuffer<float> springRestLengths;
-        private readonly ReadWriteBuffer<float3> springForces; // 输出到这个新缓冲区
-
+        private readonly ReadWriteBuffer<float3> accelerations;
+        private readonly ReadOnlyBuffer<int2> adjacencyRanges;
+        private readonly ReadOnlyBuffer<int> adjacencyNeighbours;
+        private readonly ReadOnlyBuffer<float> adjacencyRestLengths;
         private readonly float k, mass;
 
         public void Execute()
         {
-            int i = ThreadIds.X; // index of the spring
-            int2 indices = springIndices[i];
-
-            float3 pos0 = positions[indices.X];
-            float3 pos1 = positions[indices.Y];
-
-            float3 forceVec = pos1 - pos0;
-            float currentLength = Hlsl.Length(forceVec);
-
-            if (currentLength > 0.001f)
-            {
-                float3 force = (forceVec / currentLength) * (k * (currentLength - springRestLengths[i]));
-                springForces[i] = force;
-            }
-            else
-            {
-                springForces[i] = float3.Zero;
-            }
-        }
-    }
-
-    // --- 第 2 遍: 为每个粒子收集力 ---
-    [AutoConstructor]
-    [EmbeddedBytecode(DispatchAxis.X)]
-    public readonly partial struct GatherForcesShader : IComputeShader
-    {
-        private readonly ReadWriteBuffer<float3> accelerations;
-        private readonly ReadWriteBuffer<float3> springForces;
-        private readonly ReadOnlyBuffer<int2> springIndices;
-
-        private readonly int springCount;
-        private readonly float mass;
-
-        public void Execute()
-        {
-            int particleId = ThreadIds.X; // 当前粒子的索引
+            int particleId = ThreadIds.X;
+            int2 range = adjacencyRanges[particleId];
+            float3 pos = positions[particleId];
             float3 totalForce = float3.Zero;
 
-            // 遍历所有弹簧
-            for (int i = 0; i < springCount; i++)
+            for (int n = range.X; n < range.Y; n++)
             {
-                int2 indices = springIndices[i];
+                // Vector from this particle to the other end of the spring
+                float3 forceVec = positions[adjacencyNeighbours[n]] - pos;
+                float currentLength = Hlsl.Length(forceVec);
 
-                // 如果弹簧的端点0是当前粒子
-                if (indices.X == particleId)
+                if (currentLength > 0.001f)
                 {
-                    totalForce += springForces[i];
-                }
-
-                // 如果弹簧的端点1是当前粒子
-                if (indices.Y == particleId)
-                {
-                    totalForce -= springForces[i];
+                    // Hooke's law: pulled towards the neighbour when stretched, pushed away when compressed
+                    totalForce += (forceVec / currentLength) * (k * (currentLength - adjacencyRestLengths[n]));
                 }
             }
 
-            // 一次性写入总加速度
             accelerations[particleId] = totalForce / mass;
         }
     }
 
+    /// <summary>Integrates the acceleration into velocity and position.</summary>
     [AutoConstructor]
     [EmbeddedBytecode(DispatchAxis.X)]
     public readonly partial struct ParticleMoveShader : IComputeShader
@@ -376,21 +365,14 @@ namespace StableShapeGPU.Properties
         public void Execute()
         {
             int i = ThreadIds.X;
-            float3 acc = accelerations[i];
+            float3 velocity = velocities[i];
+            float3 acc = accelerations[i] - velocity * drag;
 
-            acc -= velocities[i] * drag;
-            velocities[i] += acc * timeStep;
-            velocities[i] *= damping;
-            positions[i] += velocities[i] * timeStep;
+            velocity += acc * timeStep;
+            velocity *= damping;
+
+            velocities[i] = velocity;
+            positions[i] += velocity * timeStep;
         }
-    }
-
-    // --- Utility Shader ---
-    [AutoConstructor]
-    [EmbeddedBytecode(DispatchAxis.X)]
-    public readonly partial struct ClearFloat3BufferShader : IComputeShader
-    {
-        private readonly ReadWriteBuffer<float3> buffer;
-        public void Execute() { buffer[ThreadIds.X] = float3.Zero; }
     }
 }
